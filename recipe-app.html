@@ -808,8 +808,11 @@ function renderPlanPickerDays(){
 }
 
 function assignFromPicker(dkey, meal){
-  state.planner[dkey+'_'+meal]=planPickerRecipeId;
-  addRecipeToGrocery(planPickerRecipeId);
+  const key=dkey+'_'+meal;
+  const oldRid=state.planner[key];
+  if(oldRid&&oldRid!==planPickerRecipeId) removeRecipeFromGrocery(oldRid, key);
+  state.planner[key]=planPickerRecipeId;
+  addRecipeToGrocery(planPickerRecipeId, key);
   save();
   document.getElementById('plan-picker-overlay').style.display='none';
   renderPlanPickerDays();
@@ -1048,10 +1051,18 @@ function clearWeek(){
   const dates=getWeekDates();
   dates.forEach(d=>{
     ['Breakfast','Lunch','Dinner'].forEach(m=>{
-      delete state.planner[plannerKey(d,m)];
+      const key=plannerKey(d,m);
+      const rid=state.planner[key];
+      if(rid) removeRecipeFromGrocery(rid, key);
+      delete state.planner[key];
       const sck=dateKey(d)+'_'+m+'_sidecount';
       const n=state.plannerSides[sck]||1;
-      for(let i=0;i<n;i++) delete state.planner[dateKey(d)+'_'+m+'_side_'+i];
+      for(let i=0;i<n;i++){
+        const sk=dateKey(d)+'_'+m+'_side_'+i;
+        const srid=state.planner[sk];
+        if(srid) removeRecipeFromGrocery(srid, sk);
+        delete state.planner[sk];
+      }
       delete state.plannerSides[sck];
     });
   });
@@ -1094,20 +1105,20 @@ function renderMealPickerList(){
 }
 
 function assignMeal(rid){
-  // For sides the key is already formatted as "YYYY-MM-DD_Dinner_side_0" etc.
-  // For main meals it's "YYYY-MM-DD_Dinner"
-  const isSide=pickerContext.meal.includes('_side_');
-  const key=isSide
-    ? pickerContext.date+'_'+pickerContext.meal
-    : pickerContext.date+'_'+pickerContext.meal;
+  const key=pickerContext.date+'_'+pickerContext.meal;
+  // Remove old recipe's grocery contribution for this slot before replacing
+  const oldRid=state.planner[key];
+  if(oldRid&&oldRid!==rid) removeRecipeFromGrocery(oldRid, key);
   state.planner[key]=rid;
-  addRecipeToGrocery(rid);
+  addRecipeToGrocery(rid, key);
   save();
   closeModal('meal-picker-overlay');
   renderPlanner();
 }
 function clearMealSlot(){
   const key=pickerContext.date+'_'+pickerContext.meal;
+  const oldRid=state.planner[key];
+  if(oldRid) removeRecipeFromGrocery(oldRid, key);
   delete state.planner[key];
   save();
   closeModal('meal-picker-overlay');
@@ -1126,11 +1137,17 @@ function removeSideSlot(dateStr, meal, idx){
   if(!state.plannerSides) state.plannerSides={};
   const sck=dateStr+'_'+meal+'_sidecount';
   const n=state.plannerSides[sck]||1;
+  // Remove grocery items for the side being removed
+  const removedKey=dateStr+'_'+meal+'_side_'+idx;
+  const removedRid=state.planner[removedKey];
+  if(removedRid) removeRecipeFromGrocery(removedRid, removedKey);
   // Shift side recipes down
   for(let i=idx;i<n-1;i++){
-    const next=state.planner[dateStr+'_'+meal+'_side_'+(i+1)];
-    if(next) state.planner[dateStr+'_'+meal+'_side_'+i]=next;
-    else delete state.planner[dateStr+'_'+meal+'_side_'+i];
+    const nextKey=dateStr+'_'+meal+'_side_'+(i+1);
+    const thisKey=dateStr+'_'+meal+'_side_'+i;
+    const next=state.planner[nextKey];
+    if(next) state.planner[thisKey]=next;
+    else delete state.planner[thisKey];
   }
   delete state.planner[dateStr+'_'+meal+'_side_'+(n-1)];
   state.plannerSides[sck]=Math.max(1,n-1);
@@ -1153,20 +1170,42 @@ function addPlannerToGrocery(){
 // ─── GROCERY ───
 const GROCERY_CATS=['Produce','Meat & Fish','Dairy & Eggs','Pantry','Frozen','Bakery','Snacks','Beverages','Other'];
 
-function addRecipeToGrocery(rid){
+function addRecipeToGrocery(rid, slotKey){
   const r=state.recipes.find(x=>x.id===rid);
   if(!r) return;
   (r.ingredients||[]).forEach(i=>{
     if(!i.name) return;
-    const exists=state.grocery.find(g=>g.name.toLowerCase()===i.name.toLowerCase());
+    const exists=state.grocery.find(g=>g.name.toLowerCase()===i.name.toLowerCase()&&!g.isStaple&&!g.isCustom);
     if(exists){
-      // accumulate sources
+      if(!exists.slots) exists.slots=[];
+      if(slotKey&&!exists.slots.includes(slotKey)) exists.slots.push(slotKey);
       if(!exists.sources) exists.sources=exists.fromRecipe?[exists.fromRecipe]:[];
       if(!exists.sources.includes(r.name)) exists.sources.push(r.name);
       exists.fromRecipe=exists.sources.join(', ');
     } else {
-      state.grocery.push({id:'g'+Date.now()+Math.random(),name:i.name,qty:i.qty||'',unit:i.unit||'',category:guessCategory(i.name),checked:false,fromRecipe:r.name,sources:[r.name]});
+      state.grocery.push({id:'g'+Date.now()+Math.random(),name:i.name,qty:i.qty||'',unit:i.unit||'',category:guessCategory(i.name),checked:false,fromRecipe:r.name,sources:[r.name],slots:slotKey?[slotKey]:[]});
     }
+  });
+  save();
+}
+
+function removeRecipeFromGrocery(rid, slotKey){
+  const r=state.recipes.find(x=>x.id===rid);
+  if(!r) return;
+  const ingredientNames=(r.ingredients||[]).map(i=>i.name.toLowerCase()).filter(Boolean);
+  state.grocery=state.grocery.filter(g=>{
+    if(g.isStaple||g.isCustom) return true;
+    if(!ingredientNames.includes(g.name.toLowerCase())) return true;
+    // Migrate legacy items that predate slot tracking
+    if(!g.slots) g.slots=slotKey?[slotKey]:[];
+    // Remove this slot
+    g.slots=g.slots.filter(s=>s!==slotKey);
+    // Update source label — only keep recipe name if it still appears in another slot
+    if(!g.sources) g.sources=r.name?[r.name]:[];
+    const recipeStillPlanned=g.slots.some(s=>state.planner[s]===rid);
+    if(!recipeStillPlanned) g.sources=g.sources.filter(s=>s!==r.name);
+    g.fromRecipe=g.sources.join(', ');
+    return g.slots.length>0;
   });
   save();
 }
@@ -1247,7 +1286,7 @@ function clearGroceryList(){
 function addCustomItem(){
   const name=document.getElementById('custom-item-name').value.trim();
   if(!name) return;
-  state.grocery.push({id:'g'+Date.now(),name,qty:document.getElementById('custom-item-qty').value.trim(),unit:document.getElementById('custom-item-unit').value.trim(),category:document.getElementById('custom-item-cat').value,checked:false});
+  state.grocery.push({id:'g'+Date.now(),name,qty:document.getElementById('custom-item-qty').value.trim(),unit:document.getElementById('custom-item-unit').value.trim(),category:document.getElementById('custom-item-cat').value,checked:false,isCustom:true});
   document.getElementById('custom-item-name').value='';
   document.getElementById('custom-item-qty').value='';
   document.getElementById('custom-item-unit').value='';
